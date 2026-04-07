@@ -13,6 +13,11 @@ from mlx_lm.models.cache import (
     _BaseCache,
 )
 
+# Re-exported so callers can reference cache.TurboQuantRotatingKVCache without
+# pulling in turboquant.py directly. The implementation lives next to its
+# parent class for inheritance and helper access.
+from ..turboquant import TurboQuantRotatingKVCache  # noqa: E402, F401
+
 
 def make_prompt_cache(
     model: nn.Module,

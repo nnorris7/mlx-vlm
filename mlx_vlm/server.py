@@ -69,6 +69,13 @@ def get_kv_quant_scheme():
     return os.environ.get("KV_QUANT_SCHEME", DEFAULT_KV_QUANT_SCHEME)
 
 
+def get_turbo_kv_bits_swa():
+    value = os.environ.get("TURBO_KV_BITS_SWA", "")
+    if not value:
+        return None
+    return float(value)
+
+
 def get_max_kv_size(model: str):
     max_kv_tokens = int(os.environ.get("MAX_KV_SIZE", 0))
     if max_kv_tokens == 0:
@@ -637,6 +644,7 @@ def build_generation_kwargs(
     return {
         "prefill_step_size": get_prefill_step_size(),
         "kv_bits": get_quantized_kv_bits(request.model),
+        "turbo_kv_bits_swa": get_turbo_kv_bits_swa(),
         "kv_group_size": get_kv_group_size(),
         "kv_quant_scheme": get_kv_quant_scheme(),
         "max_kv_size": get_max_kv_size(request.model),
@@ -1408,6 +1416,13 @@ def main():
         help="Number of bits for KV cache quantization.",
     )
     parser.add_argument(
+        "--turbo-kv-bits-swa",
+        type=float,
+        default=0,
+        help="TurboQuant bit-width for sliding-window (RotatingKVCache) layers. "
+        "Only takes effect when --kv-quant-scheme=turboquant.",
+    )
+    parser.add_argument(
         "--kv-quant-scheme",
         type=str,
         choices=("uniform", "turboquant"),
@@ -1450,6 +1465,8 @@ def main():
         os.environ["PRELOAD_ADAPTER"] = args.adapter_path
     os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["KV_BITS"] = str(args.kv_bits)
+    if args.turbo_kv_bits_swa:
+        os.environ["TURBO_KV_BITS_SWA"] = str(args.turbo_kv_bits_swa)
     os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)
     os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
     os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)

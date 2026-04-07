@@ -5913,3 +5913,242 @@ class TurboQuantKVCache(_BaseCache):
     @property
     def nbytes(self):
         return _state_nbytes(self.state)
+
+
+class TurboQuantRotatingKVCache(TurboQuantKVCache):
+    """SWA-aware TurboQuant KV cache.
+
+    Stores at most ``max_size`` quantized tokens in temporal order. Reuses
+    every codec, fast-quantize, and fused-decode path from
+    :class:`TurboQuantKVCache` via inheritance — only the storage layout
+    differs:
+
+    * ``self.offset``  (inherited) — total tokens seen, used by RoPE.
+    * ``self._buf_len`` — number of quantized tokens currently materialized
+      in ``self.keys`` / ``self.values``. Bounded by ``max_size``.
+
+    Once the buffer is full, each step rebuilds the buffer as
+    ``[0:keep] + [tail (max_size - keep - n_new):buf_len] + [n_new]`` using
+    the existing ``_slice_state_range`` / ``_concat_state`` helpers. The
+    cost is O(max_size·D) per step in slice/concat — the same the
+    upstream RotatingKVCache pays — but the per-step *dequantize* of the
+    full window is gone, which is the dominant cost in naive
+    implementations.
+
+    The decode path is inherited unchanged from ``TurboQuantKVCache``: the
+    ``isinstance`` check in ``models/base.py`` matches the parent class,
+    so ``decode_attention`` / ``prefill_attention`` fire automatically.
+    """
+
+    def __init__(
+        self,
+        max_size: int,
+        keep: int = 0,
+        bits: float = 4.0,
+        seed: int = DEFAULT_TURBOQUANT_SEED,
+    ):
+        super().__init__(bits=bits, seed=seed)
+        self.max_size = int(max_size)
+        self.keep = int(keep)
+        if self.keep < 0 or self.max_size <= 0 or self.keep >= self.max_size:
+            raise ValueError(
+                f"Invalid SWA cache geometry: keep={self.keep}, max_size={self.max_size}"
+            )
+        self._buf_len = 0
+
+    @classmethod
+    def from_rotating_cache(
+        cls,
+        cache: "RotatingKVCache",  # type: ignore[name-defined]
+        bits: float,
+        seed: int = DEFAULT_TURBOQUANT_SEED,
+    ) -> "TurboQuantRotatingKVCache":
+        """Convert a partially-filled mlx_lm RotatingKVCache to TurboQuant.
+
+        Handles the circular-buffer layout correctly by reordering the
+        dense state into temporal order before quantizing.
+        """
+        new = cls(max_size=cache.max_size, keep=cache.keep, bits=bits, seed=seed)
+        if cache.keys is None:
+            return new
+
+        # mlx_lm RotatingKVCache uses a circular buffer once full. Use its
+        # own _temporal_order helper to get tokens in sequence order, then
+        # slice off any uninitialized tail.
+        ordered_keys = cache._temporal_order(cache.keys)
+        ordered_values = cache._temporal_order(cache.values)
+        valid_len = min(cache.offset, cache.max_size)
+        if valid_len > 0:
+            ordered_keys = ordered_keys[..., :valid_len, :]
+            ordered_values = ordered_values[..., :valid_len, :]
+            new.update_and_fetch(ordered_keys, ordered_values)
+            # update_and_fetch advances self.offset by valid_len; restore the
+            # true total-token count so RoPE positions remain correct.
+            new.offset = cache.offset
+        return new
+
+    def _quantize_new(self, keys: mx.array, values: mx.array):
+        """Quantize new tokens, reusing the parent fast L=1 fused path."""
+        new_keys, new_values = self._try_fused_kv_quantize(keys, values)
+        if new_keys is None:
+            new_keys = self.key_codec.quantize(keys)
+            new_values = self.value_codec.quantize(values)
+        return new_keys, new_values
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array):
+        self._ensure_codecs(keys, values)
+        new_keys, new_values = self._quantize_new(keys, values)
+        n_new = keys.shape[2]
+
+        if self.keys is None:
+            initial_capacity = max(n_new, self.cache_step)
+            self.keys = _allocate_state_like(new_keys, initial_capacity)
+            self.values = _allocate_state_like(new_values, initial_capacity)
+            _write_state(self.keys, new_keys, 0)
+            _write_state(self.values, new_values, 0)
+            self._buf_len = n_new
+        elif self._buf_len + n_new <= self.max_size:
+            # Fits in the window — grow capacity as needed and append.
+            new_buf_len = self._buf_len + n_new
+            self.keys = _reserve_state_capacity(
+                self.keys, self._buf_len, new_buf_len, self.cache_step
+            )
+            self.values = _reserve_state_capacity(
+                self.values, self._buf_len, new_buf_len, self.cache_step
+            )
+            _write_state(self.keys, new_keys, self._buf_len)
+            _write_state(self.values, new_values, self._buf_len)
+            self._buf_len = new_buf_len
+        else:
+            # Window is (or would become) full — drop oldest tokens beyond
+            # the sink prefix and append new ones. Result has length
+            # exactly max_size.
+            keep_existing = self.max_size - self.keep - n_new
+            if keep_existing < 0:
+                raise ValueError(
+                    f"new chunk size ({n_new}) exceeds rolling slot "
+                    f"({self.max_size - self.keep}); chunked prefill required"
+                )
+            tail_start = self._buf_len - keep_existing
+            self.keys = self._compact_and_append(
+                self.keys, tail_start, keep_existing, new_keys
+            )
+            self.values = self._compact_and_append(
+                self.values, tail_start, keep_existing, new_values
+            )
+            self._buf_len = self.max_size
+
+        self.offset += n_new
+        self._cached_state = None
+        self._cached_state_offset = -1
+        if n_new > 1 or (self.offset % 50 == 0):
+            mx.eval(self.keys, self.values)
+
+        ks, vs = self.state
+        n_heads = keys.shape[1]
+        return (
+            _QuantizedStateProxy(ks, self._buf_len, n_heads),
+            _QuantizedStateProxy(vs, self._buf_len, n_heads),
+        )
+
+    def _compact_and_append(self, state, tail_start: int, keep_existing: int, new_state):
+        """Build [0:keep] + [tail_start:_buf_len] + new_state, in that order."""
+        result = None
+        if self.keep > 0:
+            result = _slice_state_range(state, 0, self.keep)
+        if keep_existing > 0:
+            tail = _slice_state_range(state, tail_start, self._buf_len)
+            result = _concat_state(result, tail)
+        result = _concat_state(result, new_state)
+        return result
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return None, None
+        if self._cached_state_offset == self._buf_len:
+            return self._cached_state
+        sliced = (
+            _slice_state(self.keys, self._buf_len),
+            _slice_state(self.values, self._buf_len),
+        )
+        self._cached_state = sliced
+        self._cached_state_offset = self._buf_len
+        return sliced
+
+    @state.setter
+    def state(self, value):
+        self._cached_state = None
+        self._cached_state_offset = -1
+        if value is None:
+            self.keys, self.values = None, None
+            self._buf_len = 0
+            return
+        self.keys, self.values = value
+        self._buf_len = _state_length(self.keys) if self.keys is not None else 0
+
+    @property
+    def meta_state(self):
+        return tuple(
+            map(
+                str,
+                (
+                    self.offset,
+                    self._buf_len,
+                    self.bits,
+                    self.seed,
+                    self.max_size,
+                    self.keep,
+                ),
+            )
+        )
+
+    @meta_state.setter
+    def meta_state(self, value):
+        self.offset = int(value[0])
+        self._buf_len = int(value[1])
+        self.bits = float(value[2])
+        self.seed = int(value[3])
+        self.max_size = int(value[4])
+        self.keep = int(value[5])
+
+    def is_trimmable(self):
+        return False
+
+    def trim(self, n):
+        return 0
+
+    def make_mask(
+        self,
+        N: int,
+        window_size: Optional[int] = None,
+        return_array: bool = False,
+    ):
+        # Mirrors mlx_lm.RotatingKVCache.make_mask semantics so the model
+        # side is unchanged.
+        from mlx_lm.models.cache import create_causal_mask
+
+        if N > 1:
+            window_size = window_size or self.max_size
+            offset = min(self.max_size - 1, self.offset)
+            if offset + N > window_size or return_array:
+                return create_causal_mask(N, offset, window_size=window_size)
+            return "causal"
+        if window_size is None:
+            return None
+        # Single-token decode with a tighter window than max_size: build a
+        # boolean mask over the *current* buffer length. The buffer is
+        # always in temporal order so no roll is needed.
+        if self.offset >= window_size and self.max_size > window_size:
+            return mx.arange(self._buf_len) >= (self._buf_len - window_size)
+        return None
+
+    def size(self):
+        return min(self.offset, self.max_size)
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        return _state_nbytes(self.state)
