@@ -468,6 +468,13 @@ class Gemma4Processor(ProcessorMixin):
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)
 
+        # Fallback: many Gemma 4 models (especially mlx-community quantizations)
+        # don't ship a chat_template. Use the bundled official template.
+        if getattr(tokenizer, "chat_template", None) is None:
+            _fallback = Path(__file__).parent / "chat_template.jinja"
+            if _fallback.exists():
+                tokenizer.chat_template = _fallback.read_text()
+
         # Load processor config (contains image_processor and feature_extractor settings)
         proc_config = {}
         ip_config = {}
