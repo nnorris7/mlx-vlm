@@ -2268,19 +2268,51 @@ def _gen_unrolled_score(bits: int, n_elems: int, bit_off_var: str = "") -> str:
     return "\n                + ".join(terms)
 
 
-def _gen_unrolled_value(bits: int, n_elems: int, bit_off_var: str = "") -> str:
-    """Generate value accumulation with unrolled extraction."""
+def _gen_unrolled_value(
+    bits: int, n_elems: int, bit_off_var: str = "", sparse_v: bool = False
+) -> str:
+    """Generate value accumulation with unrolled extraction.
+
+    When sparse_v=True, the accumulation is split into:
+      1) Unconditional rescale: o[i] *= factor
+      2) Conditional add: if (exp_score >= 1e-6f) o[i] += exp_score * extract(i) * vn
+
+    The branch is uniform across the simdgroup (all 32 lanes process the same
+    token), so there's no divergence cost. Skips the value codebook lookup
+    when the contribution would be negligible.
+    """
     exprs = _gen_unrolled_extract(bits, n_elems, "val_codebook", bit_off_var)
     exprs = [e.replace("kb[", "vb[") for e in exprs]
-    lines = []
-    for i, expr in enumerate(exprs):
-        lines.append(f"            o[{i}] = o[{i}] * factor + exp_score * {expr} * vn;")
+    if sparse_v:
+        rescale = "\n".join(
+            f"            o[{i}] = o[{i}] * factor;" for i in range(n_elems)
+        )
+        accum = "\n".join(
+            f"                o[{i}] += exp_score * {expr} * vn;"
+            for i, expr in enumerate(exprs)
+        )
+        return (
+            f"{rescale}\n"
+            f"            if (exp_score >= 1e-6f) {{\n"
+            f"{accum}\n"
+            f"            }}"
+        )
+    lines = [
+        f"            o[{i}] = o[{i}] * factor + exp_score * {expr} * vn;"
+        for i, expr in enumerate(exprs)
+    ]
     return "\n".join(lines)
 
 
 @lru_cache(maxsize=None)
-def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
-    """Fused MSE decode: 32 simdgroups × 32 lanes, online softmax + weighted sum."""
+def _fused_mse_decode_kernel(
+    key_bits: int, val_bits: int, dim: int = 256, sparse_v: bool = False
+):
+    """Fused MSE decode: 32 simdgroups × 32 lanes, online softmax + weighted sum.
+
+    When sparse_v=True, value accumulation is gated on exp_score >= 1e-6f
+    (uniform branch across the simdgroup, no divergence cost).
+    """
     if not _metal_available() or key_bits <= 0 or val_bits <= 0:
         return None
     if dim < 32 or dim % 32 != 0:
@@ -2360,7 +2392,7 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
             sum_exp_score = sum_exp_score * factor + exp_score;
 
             // Value accumulation — unrolled byte extraction
-            {_gen_unrolled_value(val_bits, elems_per_lane, "v_bit_off" if (elems_per_lane * val_bits) % 8 else "")}
+            {_gen_unrolled_value(val_bits, elems_per_lane, "v_bit_off" if (elems_per_lane * val_bits) % 8 else "", sparse_v=sparse_v)}
         }}
 
         // Cross-simdgroup reduction (matches MLX SDPA pattern)
@@ -2398,7 +2430,7 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
     """
 
     return mx.fast.metal_kernel(
-        name=f"turboquant_fused_mse_sdpa_k{key_bits}_v{val_bits}_d{dim}",
+        name=f"turboquant_fused_mse_sdpa_k{key_bits}_v{val_bits}_d{dim}{'_sparseV' if sparse_v else ''}",
         input_names=[
             "queries",
             "key_norms",
@@ -2414,7 +2446,9 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
 
 
 @lru_cache(maxsize=None)
-def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int, dim: int = 256):
+def _fused_mse_decode_2pass_1_kernel(
+    key_bits: int, val_bits: int, dim: int = 256, sparse_v: bool = False
+):
     """2-pass decode pass 1: block-parallel quantized attention."""
     if not _metal_available() or key_bits <= 0 or val_bits <= 0:
         return None
@@ -2488,7 +2522,7 @@ def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int, dim: int = 25
             max_score = new_max;
             sum_exp_score = sum_exp_score * factor + exp_score;
 
-            {_gen_unrolled_value(val_bits, elems_per_lane, "v_bit_off" if (elems_per_lane * val_bits) % 8 else "")}
+            {_gen_unrolled_value(val_bits, elems_per_lane, "v_bit_off" if (elems_per_lane * val_bits) % 8 else "", sparse_v=sparse_v)}
         }}
 
         // Write partial results for this block
@@ -2502,7 +2536,7 @@ def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int, dim: int = 25
     """
 
     return mx.fast.metal_kernel(
-        name=f"turboquant_mse_sdpa_2pass1_k{key_bits}_v{val_bits}_d{dim}",
+        name=f"turboquant_mse_sdpa_2pass1_k{key_bits}_v{val_bits}_d{dim}{'_sparseV' if sparse_v else ''}",
         input_names=[
             "queries",
             "key_norms",
@@ -4022,9 +4056,14 @@ def _reserve_state_capacity(state, used: int, needed: int, step: int):
 
 
 class _TurboQuantMSECodec:
-    def __init__(self, dim: int, bits: int, seed: int):
+    def __init__(self, dim: int, bits: int, seed: int, norm_correction: bool = False):
         self.dim = dim
         self.bits = bits
+        # Norm correction: store `original_norm / recon_norm` instead of raw
+        # norm so that the dequantized vector has exactly the same L2 norm as
+        # the original. Adds one dispatch per quantize call; claimed to beat
+        # q8_0 on CUDA (-1.17% PPL) and give +1.1% on Metal.
+        self.norm_correction = norm_correction
         # Use mx.hadamard_transform for power-of-2 dims (O(D log D), 1 dispatch).
         self.use_rht = dim > 0 and (dim & (dim - 1)) == 0
         if self.use_rht:
@@ -4085,6 +4124,24 @@ class _TurboQuantMSECodec:
         rotated = mx.take(self.codebook, indices, axis=0)
         return self._rotate_inverse(rotated)
 
+    def _recon_norm_from_packed(self, packed_indices: mx.array) -> mx.array:
+        """Compute L2 norm of the reconstructed (rotated) vector from packed
+        indices. Rotation preserves norm, so we skip the inverse rotation."""
+        if self.bits == 0:
+            return mx.ones(packed_indices.shape[:-1], dtype=mx.float32)
+        indices = _unpack_lowbit(packed_indices, self.bits, self.dim).astype(mx.int32)
+        rotated = mx.take(self.codebook, indices, axis=0)
+        return mx.linalg.norm(rotated, axis=-1)
+
+    def _maybe_correct_norms(
+        self, norms: mx.array, packed: mx.array
+    ) -> mx.array:
+        """If norm_correction is enabled, return norms / recon_norms; else norms."""
+        if not self.norm_correction or self.bits == 0:
+            return norms
+        recon_norms = self._recon_norm_from_packed(packed)
+        return (norms.astype(mx.float32) / mx.maximum(recon_norms, _EPS))
+
     def quantize(self, vectors: mx.array) -> TurboQuantMSEState:
         # Fast path for single-token decode: Hadamard rotation + fused quantize
         if vectors.shape[-2] == 1 and self.bits > 0 and self.use_rht:
@@ -4107,8 +4164,9 @@ class _TurboQuantMSECodec:
                     output_dtypes=[mx.uint32],
                 )[0]
                 orig = vectors.shape[:-1]
+                corrected = self._maybe_correct_norms(norms, packed)
                 return TurboQuantMSEState(
-                    norms.astype(mx.float16).reshape(orig),
+                    corrected.astype(mx.float16).reshape(orig),
                     packed.reshape(*orig, packed_width),
                 )
 
@@ -4142,17 +4200,20 @@ class _TurboQuantMSECodec:
                     output_dtypes=[mx.float16, mx.uint32],
                 )
                 orig_shape = vectors.shape[:-1]
+                corrected = self._maybe_correct_norms(norms, packed)
                 return TurboQuantMSEState(
-                    norms.reshape(orig_shape),
+                    corrected.astype(mx.float16).reshape(orig_shape),
                     packed.reshape(*orig_shape, packed_width),
                 )
 
         vectors_f32 = vectors.astype(mx.float32)
         norms = mx.linalg.norm(vectors_f32, axis=-1)
         unit_vectors = vectors_f32 / mx.maximum(norms[..., None], _EPS)
+        packed = self._quantize_unit(unit_vectors)
+        corrected = self._maybe_correct_norms(norms, packed)
         return TurboQuantMSEState(
-            norms.astype(mx.float16),
-            self._quantize_unit(unit_vectors),
+            corrected.astype(mx.float16),
+            packed,
         )
 
     def dequantize(self, state: TurboQuantMSEState) -> mx.array:
@@ -4789,11 +4850,20 @@ class _SplitCodec:
         return mx.take(merged, self.restore_order, axis=-1), denom, max_scores
 
 
-def _build_codec(tensor: mx.array, bits: float, mode: str, seed: int):
+def _build_codec(
+    tensor: mx.array,
+    bits: float,
+    mode: str,
+    seed: int,
+    norm_correction: bool = False,
+):
     bits = _validate_bits(bits)
     if math.isclose(bits, round(bits), abs_tol=1e-6):
-        codec_cls = _TurboQuantProdCodec if mode == "prod" else _TurboQuantMSECodec
-        return codec_cls(tensor.shape[-1], int(round(bits)), seed)
+        if mode == "prod":
+            return _TurboQuantProdCodec(tensor.shape[-1], int(round(bits)), seed)
+        return _TurboQuantMSECodec(
+            tensor.shape[-1], int(round(bits)), seed, norm_correction=norm_correction
+        )
     return _SplitCodec(tensor, bits, mode, seed)
 
 
@@ -4824,9 +4894,33 @@ class TurboQuantKVCache(_BaseCache):
     prefill_query_block_size = 16
     cache_step = 256
 
-    def __init__(self, bits: float, seed: int = DEFAULT_TURBOQUANT_SEED):
-        self.bits = _validate_bits(bits)
+    def __init__(
+        self,
+        bits: float,
+        seed: int = DEFAULT_TURBOQUANT_SEED,
+        key_bits: Optional[float] = None,
+        value_bits: Optional[float] = None,
+        norm_correction: bool = False,
+        sparse_v: bool = False,
+    ):
+        # If both key_bits and value_bits are provided, they take precedence and
+        # `bits` is computed as the mean for reporting purposes. Otherwise, the
+        # fractional-bits logic in _ensure_codecs applies.
+        if key_bits is not None and value_bits is not None:
+            self.key_bits = _validate_bits(key_bits)
+            self.value_bits = _validate_bits(value_bits)
+            self.bits = (self.key_bits + self.value_bits) / 2.0
+        elif key_bits is not None or value_bits is not None:
+            raise ValueError(
+                "TurboQuantKVCache: key_bits and value_bits must be provided together"
+            )
+        else:
+            self.bits = _validate_bits(bits)
+            self.key_bits = None
+            self.value_bits = None
         self.seed = seed
+        self.norm_correction = norm_correction
+        self.sparse_v = sparse_v
         self.offset = 0
         self.keys = None
         self.values = None
@@ -4839,9 +4933,23 @@ class TurboQuantKVCache(_BaseCache):
 
     @classmethod
     def from_cache(
-        cls, cache, bits: float, seed: int = DEFAULT_TURBOQUANT_SEED
+        cls,
+        cache,
+        bits: float,
+        seed: int = DEFAULT_TURBOQUANT_SEED,
+        key_bits: Optional[float] = None,
+        value_bits: Optional[float] = None,
+        norm_correction: bool = False,
+        sparse_v: bool = False,
     ) -> "TurboQuantKVCache":
-        turbo_cache = cls(bits=bits, seed=seed)
+        turbo_cache = cls(
+            bits=bits,
+            seed=seed,
+            key_bits=key_bits,
+            value_bits=value_bits,
+            norm_correction=norm_correction,
+            sparse_v=sparse_v,
+        )
         keys, values = cache.state
         if keys is not None:
             turbo_cache.update_and_fetch(keys, values)
@@ -4849,23 +4957,35 @@ class TurboQuantKVCache(_BaseCache):
 
     def _ensure_codecs(self, keys: mx.array, values: mx.array):
         if self.key_codec is None:
-            # For fractional bits (e.g. 3.5), use lower bits for keys and higher
-            # for values instead of SplitCodec. Both stay as fast integer codecs
-            # with single-tile kernel support. Values benefit more from extra bits.
-            key_bits = (
-                math.floor(self.bits)
-                if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6)
-                else self.bits
+            # Explicit per-component bits win. Otherwise, for fractional --kv-bits
+            # (e.g. 3.5), use floor for keys and ceil for values, keeping both as
+            # fast integer codecs with single-tile kernel support.
+            if self.key_bits is not None:
+                key_bits = self.key_bits
+            elif not math.isclose(self.bits, round(self.bits), abs_tol=1e-6):
+                key_bits = math.floor(self.bits)
+            else:
+                key_bits = self.bits
+            self.key_codec = _build_codec(
+                keys,
+                key_bits,
+                mode="mse",
+                seed=self.seed,
+                norm_correction=self.norm_correction,
             )
-            self.key_codec = _build_codec(keys, key_bits, mode="mse", seed=self.seed)
         if self.value_codec is None:
-            val_bits = (
-                math.ceil(self.bits)
-                if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6)
-                else self.bits
-            )
+            if self.value_bits is not None:
+                val_bits = self.value_bits
+            elif not math.isclose(self.bits, round(self.bits), abs_tol=1e-6):
+                val_bits = math.ceil(self.bits)
+            else:
+                val_bits = self.bits
             self.value_codec = _build_codec(
-                values, val_bits, mode="mse", seed=self.seed + 1
+                values,
+                val_bits,
+                mode="mse",
+                seed=self.seed + 1,
+                norm_correction=self.norm_correction,
             )
 
     def _try_fused_kv_quantize(self, keys, values):
@@ -4916,6 +5036,14 @@ class TurboQuantKVCache(_BaseCache):
         )
 
         orig = keys.shape[:-1]
+        # Apply norm correction if enabled. The kernel doesn't do this inline,
+        # so we post-process via the codec helper (costs one extra dispatch per
+        # K and V each). Skipped by default.
+        if self.norm_correction:
+            k_corrected = self.key_codec._maybe_correct_norms(k_norms, k_packed)
+            v_corrected = self.value_codec._maybe_correct_norms(v_norms, v_packed)
+            k_norms = k_corrected.astype(mx.float16)
+            v_norms = v_corrected.astype(mx.float16)
         return (
             TurboQuantMSEState(k_norms.reshape(orig), k_packed.reshape(*orig, k_pw)),
             TurboQuantMSEState(v_norms.reshape(orig), v_packed.reshape(*orig, v_pw)),
@@ -5726,7 +5854,9 @@ class TurboQuantKVCache(_BaseCache):
 
                 if total_tokens <= 2048:
                     # Single-pass: 32 simdgroups cooperate per q_head
-                    fused_kernel = _fused_mse_decode_kernel(key_bits, val_bits, D)
+                    fused_kernel = _fused_mse_decode_kernel(
+                        key_bits, val_bits, D, sparse_v=self.sparse_v
+                    )
                     if fused_kernel is not None:
                         out = fused_kernel(
                             inputs=[
@@ -5754,7 +5884,9 @@ class TurboQuantKVCache(_BaseCache):
                         return output.reshape(B, n_q_heads, L, value_dim).astype(dtype)
 
                 # 2-pass: split KV across blocks for GPU saturation
-                pass1 = _fused_mse_decode_2pass_1_kernel(key_bits, val_bits, D)
+                pass1 = _fused_mse_decode_2pass_1_kernel(
+                    key_bits, val_bits, D, sparse_v=self.sparse_v
+                )
                 pass2 = _fused_mse_decode_2pass_2_kernel()
                 if pass1 is not None and pass2 is not None:
                     if total_tokens <= 8192:

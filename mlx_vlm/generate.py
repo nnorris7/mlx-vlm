@@ -132,6 +132,46 @@ def parse_arguments():
         help="Number of bits to quantize the KV cache to.",
     )
     parser.add_argument(
+        "--kv-bits-k",
+        type=float,
+        default=None,
+        help="Key-cache bits (TurboQuant only). Must be used together with "
+        "--kv-bits-v. Overrides --kv-bits and the fractional-bits logic.",
+    )
+    parser.add_argument(
+        "--kv-bits-v",
+        type=float,
+        default=None,
+        help="Value-cache bits (TurboQuant only). Must be used together with "
+        "--kv-bits-k. Overrides --kv-bits and the fractional-bits logic.",
+    )
+    parser.add_argument(
+        "--turbo-boundary-layers",
+        type=int,
+        default=0,
+        help="Number of boundary layers on each side to leave unquantized "
+        "(TurboQuant only). Turney's 'layer-aware V compression' finding: "
+        "first N + last N layers recover 37-91%% of the quality gap. "
+        "Try 2 for aggressive compression. Default 0 preserves legacy "
+        "behavior (skip only the last layer).",
+    )
+    parser.add_argument(
+        "--turbo-norm-correction",
+        action="store_true",
+        help="Enable TurboQuant norm correction (store original_norm / "
+        "recon_norm instead of raw norm). Guarantees the dequantized vector "
+        "has the same L2 norm as the original. Adds one extra dispatch per "
+        "quantize call. Credited to @spiritbuun.",
+    )
+    parser.add_argument(
+        "--turbo-sparse-v",
+        action="store_true",
+        help="Skip value codebook lookup in fused decode kernels when softmax "
+        "weight < 1e-6 (TurboQuant only). Speeds up decode at long contexts "
+        "where attention is sparse. Branch is uniform across the simdgroup, "
+        "no SIMD divergence cost. Credited to Tom Turney's TurboQuant+.",
+    )
+    parser.add_argument(
         "--kv-quant-scheme",
         type=str,
         choices=("uniform", "turboquant"),
@@ -246,11 +286,29 @@ def maybe_quantize_kv_cache(
     kv_group_size,
     kv_bits,
     kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
+    kv_bits_k: Optional[float] = None,
+    kv_bits_v: Optional[float] = None,
+    turbo_boundary_layers: int = 0,
+    turbo_norm_correction: bool = False,
+    turbo_sparse_v: bool = False,
 ):
-    if kv_bits is None:
+    # If explicit per-component bits are provided, they take precedence and
+    # also enable quantization (even when kv_bits is None).
+    explicit_kv = kv_bits_k is not None and kv_bits_v is not None
+    if explicit_kv:
+        # Use the mean for routing decisions (uniform vs turboquant).
+        effective_bits = (kv_bits_k + kv_bits_v) / 2.0
+    else:
+        if kv_bits_k is not None or kv_bits_v is not None:
+            raise ValueError(
+                "--kv-bits-k and --kv-bits-v must be provided together"
+            )
+        effective_bits = kv_bits
+
+    if effective_bits is None:
         return
 
-    if turboquant_enabled(kv_bits, kv_quant_scheme):
+    if turboquant_enabled(effective_bits, kv_quant_scheme):
 
         def quantize_entry(entry):
             if isinstance(entry, TurboQuantKVCache):
@@ -260,10 +318,23 @@ def maybe_quantize_kv_cache(
             if isinstance(entry, cache.KVCache):
                 if entry.offset == 0:
                     # Empty: replace so update_and_fetch quantizes on the fly
-                    return TurboQuantKVCache(bits=kv_bits)
+                    return TurboQuantKVCache(
+                        bits=effective_bits,
+                        key_bits=kv_bits_k,
+                        value_bits=kv_bits_v,
+                        norm_correction=turbo_norm_correction,
+                        sparse_v=turbo_sparse_v,
+                    )
                 if entry.offset < quantized_kv_start:
                     return entry
-                return TurboQuantKVCache.from_cache(entry, bits=kv_bits)
+                return TurboQuantKVCache.from_cache(
+                    entry,
+                    bits=effective_bits,
+                    key_bits=kv_bits_k,
+                    value_bits=kv_bits_v,
+                    norm_correction=turbo_norm_correction,
+                    sparse_v=turbo_sparse_v,
+                )
             if isinstance(entry, cache.CacheList):
                 entry.caches = [quantize_entry(sub_entry) for sub_entry in entry.caches]
                 return entry
@@ -275,20 +346,47 @@ def maybe_quantize_kv_cache(
                 return tuple(quantize_entry(sub_entry) for sub_entry in entry)
             return entry
 
-        # Skip the last layer (before final norm/LM head) — it's highly
-        # sensitive to quantization in deep models (e.g. gemma-4-31b).
-        last_idx = len(prompt_cache) - 1 if len(prompt_cache) > 2 else -1
+        # Determine which cache entries to leave unquantized.
+        #
+        # Boundary semantics: the boundary-layers flag applies to the *full-
+        # attention* cache entries only (KVCache). Sliding-window (RotatingKV
+        # Cache) entries are always skipped by quantize_entry, so they're
+        # effectively already "boundary-like" (FP16). For models without SWA,
+        # every cache entry is a full-attention layer and the flag works as
+        # "first N + last N layers of the model".
+        #
+        # Default behavior (turbo_boundary_layers=0): skip only the last full-
+        # attention cache entry, which is highly sensitive to quantization in
+        # deep models (e.g. gemma-4-31b). Preserves legacy behavior for models
+        # without SWA (where the last cache entry is the last model layer).
+        full_attn_indices = [
+            i for i, c in enumerate(prompt_cache) if isinstance(c, cache.KVCache)
+        ]
+        skip_indices: set[int] = set()
+        if turbo_boundary_layers > 0 and len(full_attn_indices) > 2 * turbo_boundary_layers:
+            skip_indices.update(full_attn_indices[:turbo_boundary_layers])
+            skip_indices.update(full_attn_indices[-turbo_boundary_layers:])
+        elif len(full_attn_indices) > 2:
+            skip_indices.add(full_attn_indices[-1])
+
         for index, layer_cache in enumerate(prompt_cache):
-            if index == last_idx:
+            if index in skip_indices:
                 continue
             prompt_cache[index] = quantize_entry(layer_cache)
         return
 
+    # Uniform affine path doesn't support independent K/V bits.
+    if explicit_kv and kv_bits_k != kv_bits_v:
+        raise ValueError(
+            "Asymmetric --kv-bits-k / --kv-bits-v is only supported with "
+            "--kv-quant-scheme turboquant (uniform KV quantization uses a "
+            "single bit-width)."
+        )
     mlx_maybe_quantize_kv_cache(
         prompt_cache,
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
-        kv_bits=int(kv_bits),
+        kv_bits=int(effective_bits),
     )
 
 
@@ -388,9 +486,14 @@ def generate_step(
     prompt_cache: Optional[List[Any]] = None,
     max_kv_size: Optional[int] = None,
     kv_bits: Optional[float] = None,
+    kv_bits_k: Optional[float] = None,
+    kv_bits_v: Optional[float] = None,
     kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
     kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
+    turbo_boundary_layers: int = 0,
+    turbo_norm_correction: bool = False,
+    turbo_sparse_v: bool = False,
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
@@ -442,6 +545,11 @@ def generate_step(
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
         kv_quant_scheme=kv_quant_scheme,
+        kv_bits_k=kv_bits_k,
+        kv_bits_v=kv_bits_v,
+        turbo_boundary_layers=turbo_boundary_layers,
+        turbo_norm_correction=turbo_norm_correction,
+        turbo_sparse_v=turbo_sparse_v,
     )
 
     if sampler is None:
@@ -1520,6 +1628,30 @@ def main():
     if isinstance(args.image, str):
         args.image = [args.image]
 
+    # Validate asymmetric K/V flags
+    if (args.kv_bits_k is None) != (args.kv_bits_v is None):
+        raise SystemExit(
+            "error: --kv-bits-k and --kv-bits-v must be provided together"
+        )
+    if args.kv_bits_k is not None and args.kv_quant_scheme != "turboquant":
+        raise SystemExit(
+            "error: --kv-bits-k / --kv-bits-v requires --kv-quant-scheme turboquant"
+        )
+    if args.turbo_boundary_layers < 0:
+        raise SystemExit("error: --turbo-boundary-layers must be >= 0")
+    if args.turbo_boundary_layers > 0 and args.kv_quant_scheme != "turboquant":
+        raise SystemExit(
+            "error: --turbo-boundary-layers requires --kv-quant-scheme turboquant"
+        )
+    if args.turbo_norm_correction and args.kv_quant_scheme != "turboquant":
+        raise SystemExit(
+            "error: --turbo-norm-correction requires --kv-quant-scheme turboquant"
+        )
+    if args.turbo_sparse_v and args.kv_quant_scheme != "turboquant":
+        raise SystemExit(
+            "error: --turbo-sparse-v requires --kv-quant-scheme turboquant"
+        )
+
     model, processor = load(
         args.model,
         args.adapter_path,
@@ -1622,6 +1754,11 @@ def main():
             "verbose": args.verbose,
             "max_kv_size": args.max_kv_size,
             "kv_bits": args.kv_bits,
+            "kv_bits_k": args.kv_bits_k,
+            "kv_bits_v": args.kv_bits_v,
+            "turbo_boundary_layers": args.turbo_boundary_layers,
+            "turbo_norm_correction": args.turbo_norm_correction,
+            "turbo_sparse_v": args.turbo_sparse_v,
             "kv_group_size": args.kv_group_size,
             "kv_quant_scheme": getattr(
                 args, "kv_quant_scheme", DEFAULT_KV_QUANT_SCHEME
