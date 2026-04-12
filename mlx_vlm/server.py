@@ -19,6 +19,8 @@ from huggingface_hub import scan_cache_dir
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Required, TypeAlias, TypedDict
 
+from mlx_lm.models.cache import LRUPromptCache
+
 from .generate import (
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
@@ -43,6 +45,8 @@ from .vision_cache import VisionFeatureCache
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
+DEFAULT_PROMPT_CACHE_SIZE = 10
+DEFAULT_PROMPT_CACHE_BYTES = 0  # 0 = unlimited
 
 
 def get_prefill_step_size():
@@ -216,6 +220,11 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
     # Load the model resources
     model, processor, config = load_model_resources(model_path, adapter_path)
 
+    # Build prompt cache with configured limits
+    prompt_cache_size = int(os.environ.get("PROMPT_CACHE_SIZE", DEFAULT_PROMPT_CACHE_SIZE))
+    prompt_cache_bytes = int(os.environ.get("PROMPT_CACHE_BYTES", DEFAULT_PROMPT_CACHE_BYTES))
+    max_bytes = prompt_cache_bytes if prompt_cache_bytes > 0 else (1 << 63)
+
     model_cache = {
         "cache_key": cache_key,
         "model_path": model_path,
@@ -224,6 +233,7 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
         "processor": processor,
         "config": config,
         "vision_cache": VisionFeatureCache(),
+        "prompt_cache": LRUPromptCache(max_size=prompt_cache_size, max_bytes=max_bytes),
     }
 
     return model, processor, config
@@ -238,9 +248,11 @@ def unload_model_sync():
     print(
         f"Unloading model: {model_cache.get('model_path')}, Adapter: {model_cache.get('adapter_path')}"
     )
-    # Clear vision cache before dropping references
+    # Clear caches before dropping references
     if "vision_cache" in model_cache:
         model_cache["vision_cache"].clear()
+    if "prompt_cache" in model_cache:
+        model_cache["prompt_cache"].trim_to(n_sequences=0)
     model_cache = {}
     # Force garbage collection
     gc.collect()
@@ -689,6 +701,92 @@ def build_generation_kwargs(
     }
 
 
+def _find_text_only_prefix_len(token_ids: list[int], model_config) -> int:
+    """Return the length of the longest prefix that contains no image tokens.
+
+    We only cache text-only prefixes because image tokens require the specific
+    image features to be meaningful in the KV cache.
+    """
+    image_token_id = getattr(model_config, "image_token_id", None) or getattr(
+        model_config, "image_token_index", None
+    )
+    if image_token_id is None:
+        return len(token_ids)
+    for i, tid in enumerate(token_ids):
+        if tid == image_token_id:
+            return i
+    return len(token_ids)
+
+
+def _make_lru_prompt_cache_state(
+    lru_cache: LRUPromptCache,
+    model_key: str,
+    token_ids: list[int],
+    model_config,
+):
+    """Create a PromptCacheState pre-populated from the LRU prompt cache.
+
+    Returns (prompt_cache_state, cache_type) where cache_type is "system" if
+    only the system prefix was cached, or "user" otherwise.  Returns (None, None)
+    if no usable cache was found.
+    """
+    from .generate import PromptCacheState
+
+    text_prefix_len = _find_text_only_prefix_len(token_ids, model_config)
+    if text_prefix_len == 0:
+        return None, None
+
+    # Look up the text-only prefix in the LRU cache
+    cache_tokens = token_ids[:text_prefix_len]
+    cached_kv, remaining = lru_cache.fetch_nearest_cache(model_key, cache_tokens)
+    if cached_kv is None:
+        return None, None
+
+    # Build a PromptCacheState populated with the cached KV
+    cached_len = len(cache_tokens) - len(remaining)
+    if cached_len <= 0:
+        return None, None
+
+    state = PromptCacheState()
+    state.token_ids = token_ids[:cached_len]
+    state.cache = cached_kv
+    print(f"[prompt-cache] HIT: reusing {cached_len} cached tokens")
+    return state, "user"
+
+
+def _save_to_lru_prompt_cache(
+    lru_cache: LRUPromptCache,
+    model_key: str,
+    token_ids: list[int],
+    kv_cache,
+    model_config,
+):
+    """Save the text-only prefix of a completed generation to the LRU cache."""
+    text_prefix_len = _find_text_only_prefix_len(token_ids, model_config)
+    if text_prefix_len == 0:
+        return
+
+    import copy
+
+    prefix_tokens = token_ids[:text_prefix_len]
+
+    # Deep-copy and trim the KV cache to only the prefix portion
+    try:
+        cache_copy = copy.deepcopy(kv_cache)
+        for c in cache_copy:
+            if hasattr(c, "keys") and c.keys is not None:
+                cached_len = c.keys.shape[2] if c.keys.ndim >= 3 else 0
+                if cached_len > text_prefix_len:
+                    c.keys = c.keys[:, :, :text_prefix_len, :]
+                    c.values = c.values[:, :, :text_prefix_len, :]
+                    if hasattr(c, "offset"):
+                        c.offset = text_prefix_len
+        lru_cache.insert_cache(model_key, prefix_tokens, cache_copy, cache_type="user")
+        print(f"[prompt-cache] STORED: {text_prefix_len} tokens cached")
+    except Exception as e:
+        print(f"[prompt-cache] Failed to store cache: {e}")
+
+
 def process_tool_calls(model_output: str, tool_module, tools):
     called_tools = []
     remaining = model_output
@@ -890,6 +988,26 @@ async def responses_endpoint(openai_request: OpenAIRequest):
         )
         generation_kwargs = build_generation_kwargs(openai_request, template_kwargs)
 
+        # LRU prompt cache: look up cached KV state for text-only prefix
+        lru_cache_resp = model_cache.get("prompt_cache")
+        _resp_token_ids = None
+        if lru_cache_resp is not None:
+            from .generate import PromptCacheState
+
+            tokenizer_resp = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+            add_special_resp = (
+                getattr(processor, "chat_template", None) is None
+                if config.model_type in ("gemma3", "gemma3n", "gemma4")
+                else True
+            )
+            _resp_token_ids = tokenizer_resp.encode(formatted_prompt, add_special_tokens=add_special_resp)
+            resp_cache_state, _ = _make_lru_prompt_cache_state(
+                lru_cache_resp, openai_request.model, _resp_token_ids, config,
+            )
+            if resp_cache_state is None:
+                resp_cache_state = PromptCacheState()
+            generation_kwargs["prompt_cache_state"] = resp_cache_state
+
         generated_at = datetime.now().timestamp()
         response_id = f"resp_{uuid.uuid4().hex}"
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -1008,6 +1126,18 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                     yield f"data: {error_data}\n\n"
 
                 finally:
+                    # Save KV cache back to LRU prompt cache
+                    if (
+                        lru_cache_resp is not None
+                        and _resp_token_ids is not None
+                        and "prompt_cache_state" in generation_kwargs
+                    ):
+                        pcs = generation_kwargs["prompt_cache_state"]
+                        if pcs.cache is not None:
+                            _save_to_lru_prompt_cache(
+                                lru_cache_resp, openai_request.model,
+                                _resp_token_ids, pcs.cache, config,
+                            )
                     mx.clear_cache()
                     gc.collect()
                     print("Stream finished, cleared cache.")
@@ -1158,6 +1288,27 @@ async def chat_completions_endpoint(request: ChatRequest):
         )
         generation_kwargs = build_generation_kwargs(request, template_kwargs)
 
+        # LRU prompt cache: look up cached KV state for text-only prefix
+        lru_cache = model_cache.get("prompt_cache")
+        _prompt_token_ids = None
+        if lru_cache is not None:
+            from .generate import PromptCacheState
+
+            tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+            add_special = (
+                getattr(processor, "chat_template", None) is None
+                if config.model_type in ("gemma3", "gemma3n", "gemma4")
+                else True
+            )
+            _prompt_token_ids = tokenizer.encode(formatted_prompt, add_special_tokens=add_special)
+            prompt_cache_state, _ = _make_lru_prompt_cache_state(
+                lru_cache, request.model, _prompt_token_ids, config,
+            )
+            if prompt_cache_state is None:
+                # Cache miss — still create a state so we can save after generation
+                prompt_cache_state = PromptCacheState()
+            generation_kwargs["prompt_cache_state"] = prompt_cache_state
+
         if request.stream:
             # Streaming response
             async def stream_generator():
@@ -1249,6 +1400,18 @@ async def chat_completions_endpoint(request: ChatRequest):
                     yield f"data: {error_data}\n\n"
 
                 finally:
+                    # Save KV cache back to LRU prompt cache
+                    if (
+                        lru_cache is not None
+                        and _prompt_token_ids is not None
+                        and "prompt_cache_state" in generation_kwargs
+                    ):
+                        pcs = generation_kwargs["prompt_cache_state"]
+                        if pcs.cache is not None:
+                            _save_to_lru_prompt_cache(
+                                lru_cache, request.model,
+                                _prompt_token_ids, pcs.cache, config,
+                            )
                     mx.clear_cache()
                     gc.collect()
                     print("Stream finished, cleared cache.")
@@ -1277,6 +1440,18 @@ async def chat_completions_endpoint(request: ChatRequest):
                     vision_cache=model_cache.get("vision_cache"),
                     **generation_kwargs,
                 )
+                # Save KV cache to LRU prompt cache (non-streaming path)
+                if (
+                    lru_cache is not None
+                    and _prompt_token_ids is not None
+                    and "prompt_cache_state" in generation_kwargs
+                ):
+                    pcs = generation_kwargs["prompt_cache_state"]
+                    if pcs.cache is not None:
+                        _save_to_lru_prompt_cache(
+                            lru_cache, request.model,
+                            _prompt_token_ids, pcs.cache, config,
+                        )
                 # Clean up resources
                 mx.clear_cache()
                 gc.collect()
@@ -1513,6 +1688,21 @@ def main():
         help="Start index (of token) for the quantized KV cache.",
     )
     parser.add_argument(
+        "--prompt-cache-size",
+        type=int,
+        default=DEFAULT_PROMPT_CACHE_SIZE,
+        help="Maximum number of prompt KV caches to keep across requests. "
+        "Enables cross-request prefix sharing (e.g., system prompts). "
+        "Set to 0 to disable. Default: %(default)s.",
+    )
+    parser.add_argument(
+        "--prompt-cache-bytes",
+        type=int,
+        default=DEFAULT_PROMPT_CACHE_BYTES,
+        help="Maximum total bytes for the prompt KV cache. "
+        "0 means unlimited. Default: %(default)s.",
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -1558,6 +1748,8 @@ def main():
     os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
     os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    os.environ["PROMPT_CACHE_SIZE"] = str(args.prompt_cache_size)
+    os.environ["PROMPT_CACHE_BYTES"] = str(args.prompt_cache_bytes)
 
     uvicorn.run(
         "mlx_vlm.server:app",
