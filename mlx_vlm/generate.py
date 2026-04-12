@@ -874,21 +874,30 @@ def generate_step(
             max_kv_size=max_kv_size,
         )
 
+    _is_encoder_decoder = "decoder_input_ids" in kwargs
+    _lang_model = model.language_model  # cache attribute lookup
+
     def _step(y, inputs_embeds=None):
         nonlocal tokens, kwargs
 
         with mx.stream(generation_stream):
-            if "decoder_input_ids" in kwargs:
-                outputs = model.language_model(
+            if _is_encoder_decoder:
+                outputs = _lang_model(
                     cache=prompt_cache,
                     **kwargs,
                 )
-            else:
-                outputs = model.language_model(
+            elif kwargs:
+                outputs = _lang_model(
                     y,
                     inputs_embeds=inputs_embeds,
                     cache=prompt_cache,
                     **kwargs,
+                )
+            else:
+                outputs = _lang_model(
+                    y,
+                    inputs_embeds=inputs_embeds,
+                    cache=prompt_cache,
                 )
 
             logits = outputs.logits[:, -1, :]
@@ -901,14 +910,17 @@ def generate_step(
 
             quantize_cache_fn(prompt_cache)
 
-            logprobs = logits - mx.logsumexp(logits)
+            logprobs = logits - mx.logsumexp(logits, keepdims=True)
             y = sampler(logprobs)
 
-            if outputs.cross_attention_states is not None:
-                kwargs = {"cross_attention_states": outputs.cross_attention_states}
-            elif outputs.encoder_outputs is not None:
-                kwargs = {"encoder_outputs": outputs.encoder_outputs}
-            else:
+            # Update kwargs for next decode step (cross-attention / encoder state)
+            cross = outputs.cross_attention_states
+            enc = outputs.encoder_outputs
+            if cross is not None:
+                kwargs = {"cross_attention_states": cross}
+            elif enc is not None:
+                kwargs = {"encoder_outputs": enc}
+            elif kwargs:
                 kwargs = {}
 
             return y, logprobs.squeeze(0)
@@ -954,13 +966,13 @@ def generate_step(
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
 
-    mx.async_eval(y)
+    mx.async_eval(y, logprobs)
 
     n = 0
     while True:
         if n != max_tokens:
             next_y, next_logprobs = _step(y[None])
-            mx.async_eval(next_y)
+            mx.async_eval(next_y, next_logprobs)
         if n == 0:
             mx.eval(y)
         if n == max_tokens:
