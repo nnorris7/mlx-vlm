@@ -234,7 +234,30 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
         "config": config,
         "vision_cache": VisionFeatureCache(),
         "prompt_cache": LRUPromptCache(max_size=prompt_cache_size, max_bytes=max_bytes),
+        "draft_model": None,
     }
+
+    # Load draft model for speculative decoding if configured
+    draft_model_path = os.environ.get("DRAFT_MODEL")
+    if draft_model_path:
+        from mlx_lm.utils import load as mlx_lm_load
+
+        print(f"Loading draft model from: {draft_model_path}")
+        draft_model_obj, draft_tokenizer = mlx_lm_load(draft_model_path)
+        # Validate vocab size matches
+        main_vocab = getattr(config, "vocab_size", None) or getattr(
+            getattr(config, "text_config", None), "vocab_size", None
+        )
+        draft_vocab = draft_tokenizer.vocab_size if hasattr(draft_tokenizer, "vocab_size") else None
+        if main_vocab and draft_vocab and main_vocab != draft_vocab:
+            print(
+                f"WARNING: Draft model vocab size ({draft_vocab}) != "
+                f"main model vocab size ({main_vocab}). "
+                f"Speculative decoding may produce incorrect results."
+            )
+        else:
+            print(f"Draft model loaded (vocab_size={draft_vocab})")
+        model_cache["draft_model"] = draft_model_obj
 
     return model, processor, config
 
@@ -684,7 +707,7 @@ def build_generation_kwargs(
     request: Any,
     template_kwargs: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
+    kwargs = {
         "prefill_step_size": get_prefill_step_size(),
         "kv_bits": get_quantized_kv_bits(request.model),
         "kv_bits_k": get_quantized_kv_bits_k(request.model),
@@ -699,6 +722,12 @@ def build_generation_kwargs(
         **request.generation_kwargs(),
         **template_kwargs,
     }
+    # Inject draft model for speculative decoding if configured
+    draft_model = model_cache.get("draft_model")
+    if draft_model is not None:
+        kwargs["draft_model"] = draft_model
+        kwargs["num_draft_tokens"] = int(os.environ.get("NUM_DRAFT_TOKENS", "3"))
+    return kwargs
 
 
 def _find_text_only_prefix_len(token_ids: list[int], model_config) -> int:
@@ -1688,6 +1717,20 @@ def main():
         help="Start index (of token) for the quantized KV cache.",
     )
     parser.add_argument(
+        "--draft-model",
+        type=str,
+        default=None,
+        help="Path or HuggingFace repo for a text-only draft model (from mlx-lm) "
+        "for speculative decoding. Must share the same vocabulary as the main model. "
+        "Example: mlx-community/Qwen3-0.6B-4bit",
+    )
+    parser.add_argument(
+        "--num-draft-tokens",
+        type=int,
+        default=3,
+        help="Number of tokens to generate speculatively per step. Default: %(default)s.",
+    )
+    parser.add_argument(
         "--prompt-cache-size",
         type=int,
         default=DEFAULT_PROMPT_CACHE_SIZE,
@@ -1750,6 +1793,9 @@ def main():
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
     os.environ["PROMPT_CACHE_SIZE"] = str(args.prompt_cache_size)
     os.environ["PROMPT_CACHE_BYTES"] = str(args.prompt_cache_bytes)
+    if args.draft_model:
+        os.environ["DRAFT_MODEL"] = args.draft_model
+    os.environ["NUM_DRAFT_TOKENS"] = str(args.num_draft_tokens)
 
     uvicorn.run(
         "mlx_vlm.server:app",
