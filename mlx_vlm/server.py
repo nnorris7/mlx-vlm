@@ -70,6 +70,44 @@ def get_quantized_kv_bits(model: str):
     return kv_bits
 
 
+def _get_optional_float(name: str):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def get_quantized_kv_bits_k(model: str):
+    if "qat" in model:
+        return None
+    return _get_optional_float("KV_BITS_K")
+
+
+def get_quantized_kv_bits_v(model: str):
+    if "qat" in model:
+        return None
+    return _get_optional_float("KV_BITS_V")
+
+
+def get_turbo_boundary_layers():
+    try:
+        return int(os.environ.get("TURBO_BOUNDARY_LAYERS", "0"))
+    except ValueError:
+        return 0
+
+
+def get_turbo_norm_correction():
+    return os.environ.get("TURBO_NORM_CORRECTION", "0") in ("1", "true", "True")
+
+
+def get_turbo_sparse_v():
+    return os.environ.get("TURBO_SPARSE_V", "0") in ("1", "true", "True")
+
+
 def get_kv_group_size():
     return int(os.environ.get("KV_GROUP_SIZE", DEFAULT_KV_GROUP_SIZE))
 
@@ -191,9 +229,14 @@ class ResponseGenerator:
         vision_cache=None,
         draft_model=None,
         kv_bits=None,
+        kv_bits_k=None,
+        kv_bits_v=None,
         kv_group_size=DEFAULT_KV_GROUP_SIZE,
         kv_quant_scheme=DEFAULT_KV_QUANT_SCHEME,
         quantized_kv_start=DEFAULT_QUANTIZED_KV_START,
+        turbo_boundary_layers=0,
+        turbo_norm_correction=False,
+        turbo_sparse_v=False,
         top_logprobs_k=0,
     ):
         self.model = model
@@ -202,9 +245,14 @@ class ResponseGenerator:
         self.vision_cache = vision_cache
         self.draft_model = draft_model
         self.kv_bits = kv_bits
+        self.kv_bits_k = kv_bits_k
+        self.kv_bits_v = kv_bits_v
         self.kv_group_size = kv_group_size
         self.kv_quant_scheme = kv_quant_scheme
         self.quantized_kv_start = quantized_kv_start
+        self.turbo_boundary_layers = turbo_boundary_layers
+        self.turbo_norm_correction = turbo_norm_correction
+        self.turbo_sparse_v = turbo_sparse_v
         self.top_logprobs_k = top_logprobs_k
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
@@ -407,9 +455,14 @@ class ResponseGenerator:
                             stop_tokens=self.stop_tokens,
                             sampler=self._make_sampler(args),
                             kv_bits=self.kv_bits,
+                            kv_bits_k=self.kv_bits_k,
+                            kv_bits_v=self.kv_bits_v,
                             kv_group_size=self.kv_group_size,
                             kv_quant_scheme=self.kv_quant_scheme,
                             quantized_kv_start=self.quantized_kv_start,
+                            turbo_boundary_layers=self.turbo_boundary_layers,
+                            turbo_norm_correction=self.turbo_norm_correction,
+                            turbo_sparse_v=self.turbo_sparse_v,
                             top_logprobs_k=self.top_logprobs_k,
                         )
 
@@ -978,9 +1031,14 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
 
     # KV cache quantization (uniform or TurboQuant)
     kv_bits = get_quantized_kv_bits(model_path)
+    kv_bits_k = get_quantized_kv_bits_k(model_path)
+    kv_bits_v = get_quantized_kv_bits_v(model_path)
     kv_group_size = get_kv_group_size()
     quantized_kv_start = get_quantized_kv_start()
     kv_quant_scheme = get_kv_quant_scheme()
+    turbo_boundary_layers = get_turbo_boundary_layers()
+    turbo_norm_correction = get_turbo_norm_correction()
+    turbo_sparse_v = get_turbo_sparse_v()
 
     response_generator = ResponseGenerator(
         model=model,
@@ -989,9 +1047,14 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
         vision_cache=vision_cache,
         draft_model=draft_model,
         kv_bits=kv_bits,
+        kv_bits_k=kv_bits_k,
+        kv_bits_v=kv_bits_v,
         kv_group_size=kv_group_size,
         kv_quant_scheme=kv_quant_scheme,
         quantized_kv_start=quantized_kv_start,
+        turbo_boundary_layers=turbo_boundary_layers,
+        turbo_norm_correction=turbo_norm_correction,
+        turbo_sparse_v=turbo_sparse_v,
         top_logprobs_k=get_top_logprobs_k(),
     )
 
@@ -2538,6 +2601,42 @@ def main():
         help="Number of bits for KV cache quantization (e.g. 3.5 for TurboQuant).",
     )
     parser.add_argument(
+        "--kv-bits-k",
+        type=float,
+        default=0,
+        help="Key-cache bits (TurboQuant only). Must be used together with "
+        "--kv-bits-v. Overrides --kv-bits and the fractional-bits logic.",
+    )
+    parser.add_argument(
+        "--kv-bits-v",
+        type=float,
+        default=0,
+        help="Value-cache bits (TurboQuant only). Must be used together with "
+        "--kv-bits-k. Overrides --kv-bits and the fractional-bits logic.",
+    )
+    parser.add_argument(
+        "--turbo-boundary-layers",
+        type=int,
+        default=0,
+        help="Number of boundary layers on each side to leave unquantized "
+        "(TurboQuant only). First N + last N layers skip quantization to "
+        "preserve quality. Try 2 for aggressive compression. Default 0 "
+        "preserves legacy behavior (skip only the last layer).",
+    )
+    parser.add_argument(
+        "--turbo-norm-correction",
+        action="store_true",
+        help="Enable TurboQuant norm correction (store original_norm / "
+        "recon_norm instead of raw norm). Guarantees dequantized vector L2 "
+        "norm matches the original.",
+    )
+    parser.add_argument(
+        "--turbo-sparse-v",
+        action="store_true",
+        help="Skip value codebook lookup in fused decode kernels when softmax "
+        "weight < 1e-6 (TurboQuant only). Speeds up decode at long contexts.",
+    )
+    parser.add_argument(
         "--kv-quant-scheme",
         type=str,
         choices=("uniform", "turboquant"),
@@ -2615,10 +2714,39 @@ def main():
         os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
         if args.draft_block_size is not None:
             os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
+    # Validate asymmetric K/V flags (TurboQuant+)
+    if (args.kv_bits_k > 0) != (args.kv_bits_v > 0):
+        parser.error("--kv-bits-k and --kv-bits-v must be provided together")
+    if args.kv_bits_k > 0 and args.kv_quant_scheme != "turboquant":
+        parser.error(
+            "--kv-bits-k / --kv-bits-v requires --kv-quant-scheme turboquant"
+        )
+    if args.turbo_boundary_layers < 0:
+        parser.error("--turbo-boundary-layers must be >= 0")
+    if args.turbo_boundary_layers > 0 and args.kv_quant_scheme != "turboquant":
+        parser.error(
+            "--turbo-boundary-layers requires --kv-quant-scheme turboquant"
+        )
+    if args.turbo_norm_correction and args.kv_quant_scheme != "turboquant":
+        parser.error(
+            "--turbo-norm-correction requires --kv-quant-scheme turboquant"
+        )
+    if args.turbo_sparse_v and args.kv_quant_scheme != "turboquant":
+        parser.error("--turbo-sparse-v requires --kv-quant-scheme turboquant")
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     if args.kv_bits is not None:
         os.environ["KV_BITS"] = str(args.kv_bits)
+    if args.kv_bits_k > 0:
+        os.environ["KV_BITS_K"] = str(args.kv_bits_k)
+    if args.kv_bits_v > 0:
+        os.environ["KV_BITS_V"] = str(args.kv_bits_v)
+    if args.turbo_boundary_layers > 0:
+        os.environ["TURBO_BOUNDARY_LAYERS"] = str(args.turbo_boundary_layers)
+    if args.turbo_norm_correction:
+        os.environ["TURBO_NORM_CORRECTION"] = "1"
+    if args.turbo_sparse_v:
+        os.environ["TURBO_SPARSE_V"] = "1"
     os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)
     os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
     if args.max_kv_size is not None:
