@@ -56,6 +56,10 @@ DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 
 
+def get_default_max_tokens():
+    return int(os.environ.get("DEFAULT_MAX_TOKENS", DEFAULT_MAX_TOKENS))
+
+
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
 
@@ -1207,7 +1211,8 @@ class OpenAIRequest(FlexibleBaseModel):
     )
     model: str = Field(..., description="The model to use for generation.")
     max_output_tokens: int = Field(
-        DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
+        default_factory=get_default_max_tokens,
+        description="Maximum number of tokens to generate.",
     )
     temperature: float = Field(
         DEFAULT_TEMPERATURE, description="Temperature for sampling."
@@ -1393,7 +1398,8 @@ class VLMRequest(FlexibleBaseModel):
         None, description="The path to the adapter weights."
     )
     max_tokens: int = Field(
-        DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
+        default_factory=get_default_max_tokens,
+        description="Maximum number of tokens to generate.",
     )
     temperature: float = Field(
         DEFAULT_TEMPERATURE, description="Temperature for sampling."
@@ -2689,6 +2695,13 @@ def main():
         ),
     )
     parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=DEFAULT_MAX_TOKENS,
+        help="Default maximum number of tokens to generate when not specified "
+        "in the request (default: %(default)s).",
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -2709,6 +2722,7 @@ def main():
         if args.adapter_path:
             os.environ["MLX_VLM_PRELOAD_ADAPTER"] = args.adapter_path
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
+    os.environ["DEFAULT_MAX_TOKENS"] = str(args.max_tokens)
     if args.draft_model:
         os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model
         os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
